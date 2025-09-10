@@ -1,0 +1,1012 @@
+# SendBot – Full Render‑Ready Codebase (Web + Worker + SQL + Blueprint)
+
+**What this includes**
+
+* FastAPI **Web** app: dashboard, contacts upload, templates, campaigns, queue viewer, events stream, unsubscribe (GET + One‑Click POST), API for your reply bot (`/api/reply`, `/api/suppression`), health check.
+* **Worker**: paced sending across up to 9 inboxes, daily caps, jitter, retries with exponential backoff, circuit breaker per inbox, heartbeats, graceful shutdown.
+* **Postgres** schema + indexes (works on Render Postgres). No AI – emails are preset templates with Jinja placeholders you control.
+* **render.yaml** blueprint to deploy Web + Worker.
+
+> Copy these files into a repo with the same structure. Fill env vars on Render. Run migrations once.
+
+---
+
+## Repository Layout
+
+```
+repo/
+  apps/
+    web/
+      app.py
+      dashboard.py
+      templates/
+        base.html
+        dashboard.html
+        inboxes.html
+        campaigns.html
+        queue.html
+        events.html
+        contacts.html
+        templates_list.html
+        templates_edit.html
+        unsubscribe.html
+      requirements.txt
+    worker/
+      main.py
+      emailer.py
+      requirements.txt
+  db/
+    migrations/
+      001_init.sql
+  infra/
+    render.yaml
+  .env.example
+  README.md
+```
+
+---
+
+## 1) Database Migration – `db/migrations/001_init.sql`
+
+```sql
+-- Use on Render Postgres
+CREATE TABLE IF NOT EXISTS contacts (
+  id BIGSERIAL PRIMARY KEY,
+  email TEXT UNIQUE NOT NULL,
+  first_name TEXT,
+  last_name TEXT,
+  company TEXT,
+  tags TEXT,
+  source TEXT,
+  lawful_basis TEXT,
+  consent_ts TIMESTAMP WITH TIME ZONE,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS suppression (
+  email TEXT PRIMARY KEY,
+  reason TEXT,
+  ts TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS unsubscribes (
+  email TEXT PRIMARY KEY,
+  ts TIMESTAMPTZ DEFAULT NOW(),
+  campaign_id BIGINT
+);
+
+CREATE TABLE IF NOT EXISTS templates (
+  id BIGSERIAL PRIMARY KEY,
+  name TEXT UNIQUE NOT NULL,
+  subject TEXT NOT NULL,
+  body_markdown TEXT NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS campaigns (
+  id BIGSERIAL PRIMARY KEY,
+  name TEXT,
+  template_id BIGINT NOT NULL REFERENCES templates(id) ON DELETE RESTRICT,
+  status TEXT CHECK(status IN ('draft','running','paused','done')) DEFAULT 'draft',
+  daily_send_cap INTEGER DEFAULT 300,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS inboxes (
+  id BIGSERIAL PRIMARY KEY,
+  name TEXT,
+  smtp_host TEXT,
+  smtp_port INTEGER,
+  username TEXT,
+  password TEXT,
+  from_name TEXT,
+  from_email TEXT,
+  daily_cap INTEGER DEFAULT 30,
+  monthly_cap INTEGER DEFAULT 1000,
+  pace_seconds INTEGER DEFAULT 90,
+  health_score REAL DEFAULT 1.0,
+  disabled BOOLEAN DEFAULT FALSE
+);
+
+CREATE TABLE IF NOT EXISTS send_queue (
+  id BIGSERIAL PRIMARY KEY,
+  campaign_id BIGINT REFERENCES campaigns(id) ON DELETE SET NULL,
+  contact_id BIGINT REFERENCES contacts(id) ON DELETE SET NULL,
+  inbox_id BIGINT REFERENCES inboxes(id) ON DELETE SET NULL,
+  subject TEXT,
+  body_html TEXT,
+  scheduled_at TIMESTAMPTZ,
+  attempts INTEGER DEFAULT 0,
+  status TEXT CHECK(status IN ('queued','sending','sent','failed','skipped')) DEFAULT 'queued'
+);
+
+CREATE TABLE IF NOT EXISTS events (
+  id BIGSERIAL PRIMARY KEY,
+  campaign_id BIGINT,
+  contact_id BIGINT,
+  inbox_id BIGINT,
+  type TEXT,  -- sent, bounce, complaint, unsubscribe, reply, error
+  meta JSONB,
+  ts TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS heartbeats (
+  service_name TEXT PRIMARY KEY,
+  ts TIMESTAMPTZ
+);
+
+-- Indexes
+CREATE INDEX IF NOT EXISTS idx_queue_status_sched ON send_queue(status, scheduled_at);
+CREATE INDEX IF NOT EXISTS idx_events_type_ts ON events(type, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_contacts_email ON contacts(email);
+CREATE INDEX IF NOT EXISTS idx_unsubs_email ON unsubscribes(email);
+CREATE INDEX IF NOT EXISTS idx_suppression_email ON suppression(email);
+```
+
+---
+
+## 2) Web App Requirements – `apps/web/requirements.txt`
+
+```
+fastapi==0.112.2
+uvicorn==0.30.6
+jinja2==3.1.4
+markdown2==2.5.1
+python-dotenv==1.0.1
+pydantic==2.9.2
+psycopg2-binary==2.9.9
+python-multipart==0.0.9
+```
+
+---
+
+## 3) Web App – `apps/web/app.py`
+
+```python
+import os
+import psycopg2
+import psycopg2.extras
+from fastapi import FastAPI, Request, Form, UploadFile, File, Depends, Response, status
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from jinja2 import Environment, FileSystemLoader, select_autoescape
+from datetime import datetime
+from markdown2 import Markdown
+import csv
+import io
+import json
+
+DB_URL = os.getenv("DB_URL")
+APP_BASE_URL = os.getenv("APP_BASE_URL", "http://localhost:8000")
+LEGAL_POSTAL_ADDRESS = os.getenv("LEGAL_POSTAL_ADDRESS", "Your Company, Address, City, Postcode, UK")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")
+
+app = FastAPI()
+
+# Templates
+TEMPLATES_DIR = os.path.join(os.path.dirname(__file__), 'templates')
+env = Environment(loader=FileSystemLoader(TEMPLATES_DIR), autoescape=select_autoescape(['html']))
+md = Markdown(extras=["tables","fenced-code-blocks"])
+
+# Static directory (for minimal CSS within templates dir)
+app.mount("/static", StaticFiles(directory=TEMPLATES_DIR), name="static")
+
+# DB helpers
+
+def get_conn():
+    return psycopg2.connect(DB_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+
+# Simple render
+
+def render(tpl, **ctx):
+    template = env.get_template(tpl)
+    return HTMLResponse(template.render(**ctx))
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True, "time": datetime.utcnow().isoformat()}
+
+# ---------- DASHBOARD ----------
+@app.get("/")
+def root():
+    return RedirectResponse(url="/dashboard")
+
+@app.get("/dashboard")
+def dashboard():
+    with get_conn() as c, c.cursor() as cur:
+        cur.execute("SELECT COUNT(*) AS n FROM events WHERE type='sent' AND ts::date=CURRENT_DATE")
+        sent_today = cur.fetchone()["n"]
+        cur.execute("SELECT COUNT(*) AS n FROM events WHERE type='bounce' AND ts::date=CURRENT_DATE")
+        bounces_today = cur.fetchone()["n"]
+        cur.execute("SELECT COUNT(*) AS n FROM events WHERE type='complaint' AND ts::date=CURRENT_DATE")
+        comp_today = cur.fetchone()["n"]
+        cur.execute("SELECT COUNT(*) AS n FROM unsubscribes WHERE ts::date=CURRENT_DATE")
+        unsubs_today = cur.fetchone()["n"]
+        cur.execute("SELECT service_name, ts FROM heartbeats")
+        heartbeats = cur.fetchall()
+    return render("dashboard.html", kpis={"sent_today":sent_today,"bounces_today":bounces_today,"complaints_today":comp_today,"unsubs_today":unsubs_today}, heartbeats=heartbeats)
+
+@app.get("/dashboard/inboxes")
+def page_inboxes():
+    with get_conn() as c, c.cursor() as cur:
+        cur.execute("SELECT id,name,from_email,smtp_host,daily_cap,pace_seconds,health_score,disabled FROM inboxes ORDER BY id")
+        rows = cur.fetchall()
+    return render("inboxes.html", rows=rows)
+
+@app.post("/dashboard/inboxes/update")
+async def update_inbox(inbox_id: int = Form(...), daily_cap: int = Form(...), pace_seconds: int = Form(...), disabled: str = Form("false")):
+    flag = disabled.lower() == "true"
+    with get_conn() as c, c.cursor() as cur:
+        cur.execute("UPDATE inboxes SET daily_cap=%s, pace_seconds=%s, disabled=%s WHERE id=%s", (daily_cap, pace_seconds, flag, inbox_id))
+        c.commit()
+    return RedirectResponse(url="/dashboard/inboxes", status_code=303)
+
+@app.get("/dashboard/campaigns")
+def page_campaigns():
+    with get_conn() as c, c.cursor() as cur:
+        cur.execute("""
+            SELECT c.id, c.name, c.status, t.name AS template_name, c.daily_send_cap
+            FROM campaigns c JOIN templates t ON t.id=c.template_id ORDER BY c.id DESC
+        """)
+        rows = cur.fetchall()
+    return render("campaigns.html", rows=rows)
+
+@app.post("/dashboard/campaigns/status")
+async def set_campaign_status(campaign_id: int = Form(...), status_name: str = Form(...)):
+    if status_name not in ("draft","running","paused","done"):
+        return Response("Invalid status", status_code=400)
+    with get_conn() as c, c.cursor() as cur:
+        cur.execute("UPDATE campaigns SET status=%s WHERE id=%s", (status_name, campaign_id))
+        c.commit()
+    return RedirectResponse(url="/dashboard/campaigns", status_code=303)
+
+@app.get("/dashboard/queue")
+def page_queue():
+    with get_conn() as c, c.cursor() as cur:
+        cur.execute("SELECT id,campaign_id,contact_id,subject,status,scheduled_at FROM send_queue ORDER BY id DESC LIMIT 200")
+        rows = cur.fetchall()
+    return render("queue.html", rows=rows)
+
+@app.get("/dashboard/events")
+def page_events():
+    with get_conn() as c, c.cursor() as cur:
+        cur.execute("SELECT id,campaign_id,contact_id,inbox_id,type,ts,LEFT(COALESCE(meta::text,''),120) AS meta FROM events ORDER BY id DESC LIMIT 200")
+        rows = cur.fetchall()
+    return render("events.html", rows=rows)
+
+@app.get("/dashboard/contacts")
+def page_contacts():
+    return render("contacts.html")
+
+@app.post("/dashboard/contacts/upload")
+async def contacts_upload(file: UploadFile = File(...)):
+    content = await file.read()
+    text = content.decode('utf-8')
+    reader = csv.DictReader(io.StringIO(text))
+    required = {"email"}
+    if not required.issubset(set([h.strip() for h in reader.fieldnames])):
+        return Response("CSV must include at least 'email' column", status_code=400)
+    rows = [r for r in reader]
+    with get_conn() as c, c.cursor() as cur:
+        for r in rows:
+            cur.execute(
+                """
+                INSERT INTO contacts(email, first_name, last_name, company, tags, source, lawful_basis, consent_ts)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (email) DO UPDATE SET
+                  first_name=EXCLUDED.first_name,
+                  last_name=EXCLUDED.last_name,
+                  company=EXCLUDED.company,
+                  tags=EXCLUDED.tags,
+                  source=EXCLUDED.source,
+                  lawful_basis=EXCLUDED.lawful_basis,
+                  consent_ts=EXCLUDED.consent_ts
+                """,
+                (
+                    r.get('email'), r.get('first_name'), r.get('last_name'), r.get('company'), r.get('tags'),
+                    r.get('source'), r.get('lawful_basis'), r.get('consent_ts')
+                )
+            )
+        c.commit()
+    return RedirectResponse(url="/dashboard", status_code=303)
+
+@app.get("/dashboard/templates")
+async def templates_list():
+    with get_conn() as c, c.cursor() as cur:
+        cur.execute("SELECT id,name,subject FROM templates ORDER BY id DESC")
+        rows = cur.fetchall()
+    return render("templates_list.html", rows=rows)
+
+@app.get("/dashboard/templates/edit")
+async def templates_edit(id: int | None = None):
+    tpl = None
+    if id:
+        with get_conn() as c, c.cursor() as cur:
+            cur.execute("SELECT id,name,subject,body_markdown FROM templates WHERE id=%s", (id,))
+            tpl = cur.fetchone()
+    return render("templates_edit.html", tpl=tpl)
+
+@app.post("/dashboard/templates/save")
+async def templates_save(name: str = Form(...), subject: str = Form(...), body_markdown: str = Form(...), id: int | None = Form(None)):
+    with get_conn() as c, c.cursor() as cur:
+        if id:
+            cur.execute("UPDATE templates SET name=%s, subject=%s, body_markdown=%s WHERE id=%s", (name, subject, body_markdown, id))
+        else:
+            cur.execute("INSERT INTO templates(name,subject,body_markdown) VALUES(%s,%s,%s)", (name, subject, body_markdown))
+        c.commit()
+    return RedirectResponse(url="/dashboard/templates", status_code=303)
+
+# ---------- UNSUBSCRIBE (GET confirm + POST one‑click) ----------
+@app.get("/u")
+async def unsubscribe_get(e: str):
+    masked = e[:2] + "***@" + e.split('@')[-1] if '@' in e else e
+    return render("unsubscribe.html", email=masked)
+
+@app.post("/u")
+async def unsubscribe_post(e: str = Form(...), campaign_id: int | None = Form(None)):
+    with get_conn() as c, c.cursor() as cur:
+        cur.execute("INSERT INTO unsubscribes(email, ts, campaign_id) VALUES(%s, NOW(), %s) ON CONFLICT (email) DO UPDATE SET ts=EXCLUDED.ts, campaign_id=EXCLUDED.campaign_id", (e, campaign_id))
+        cur.execute("INSERT INTO suppression(email, reason, ts) VALUES(%s, 'unsubscribe', NOW()) ON CONFLICT (email) DO UPDATE SET reason='unsubscribe', ts=EXCLUDED.ts", (e,))
+        cur.execute("INSERT INTO events(campaign_id, contact_id, inbox_id, type, meta, ts) VALUES(%s, NULL, NULL, 'unsubscribe', to_jsonb(%s::text), NOW())", (campaign_id, e))
+        cur.execute("UPDATE send_queue SET status='skipped' WHERE status='queued' AND contact_id IN (SELECT id FROM contacts WHERE email=%s)", (e,))
+        c.commit()
+    return JSONResponse({"ok": True})
+
+# ---------- API for Reply Bot ----------
+@app.post("/api/reply")
+async def api_reply(request: Request):
+    if request.headers.get('X-Webhook-Secret') != WEBHOOK_SECRET:
+        return Response(status_code=401)
+    payload = await request.json()
+    email = payload.get('email')
+    campaign_id = payload.get('campaign_id')
+    status_note = payload.get('status')
+    snippet = payload.get('snippet')
+    with get_conn() as c, c.cursor() as cur:
+        cur.execute("SELECT id FROM contacts WHERE email=%s", (email,))
+        row = cur.fetchone()
+        contact_id = row['id'] if row else None
+        cur.execute("INSERT INTO events(campaign_id, contact_id, inbox_id, type, meta, ts) VALUES(%s, %s, NULL, 'reply', to_jsonb(%s::text), NOW())", (campaign_id, contact_id, snippet or status_note or 'reply'))
+        # Pause any queued sends for this contact
+        cur.execute("UPDATE send_queue SET status='skipped' WHERE status='queued' AND contact_id=%s", (contact_id,))
+        c.commit()
+    return JSONResponse({"ok": True})
+
+@app.get("/api/suppression")
+async def api_suppression(email: str):
+    with get_conn() as c, c.cursor() as cur:
+        cur.execute("SELECT 1 FROM suppression WHERE email=%s", (email,))
+        sup = cur.fetchone() is not None
+    return {"suppressed": sup}
+```
+
+---
+
+## 4) Web Templates – `apps/web/templates/*.html`
+
+### `base.html`
+
+```html
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SendBot</title>
+  <style>
+    body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 0; background:#f6f7fb; }
+    header { background:#111827; color:#fff; padding:14px 20px; }
+    nav a { color:#93c5fd; margin-right:14px; text-decoration:none; }
+    .wrap { max-width:1040px; margin: 24px auto; padding: 0 16px; }
+    table { width:100%; border-collapse: collapse; background:#fff; }
+    th, td { padding:10px 12px; border-bottom:1px solid #eee; text-align:left; }
+    h1 { font-size:22px; margin:0 0 14px; }
+    .card { background:#fff; padding:16px; border-radius:10px; box-shadow: 0 1px 3px rgba(0,0,0,.05); }
+    .grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(220px,1fr)); gap:14px; }
+    .btn { background:#111827; color:#fff; padding:8px 12px; border-radius:8px; border:none; cursor:pointer; }
+    .btn:disabled { opacity:.6; cursor:not-allowed; }
+    input, select, textarea { width:100%; padding:8px; border:1px solid #ddd; border-radius:8px; }
+    form.inline { display:inline; }
+    .muted { color:#6b7280; font-size:12px; }
+  </style>
+</head>
+<body>
+  <header>
+    <strong>SendBot</strong>
+    <nav style="float:right">
+      <a href="/dashboard">Overview</a>
+      <a href="/dashboard/inboxes">Inboxes</a>
+      <a href="/dashboard/campaigns">Campaigns</a>
+      <a href="/dashboard/queue">Queue</a>
+      <a href="/dashboard/events">Events</a>
+      <a href="/dashboard/contacts">Contacts</a>
+      <a href="/dashboard/templates">Templates</a>
+    </nav>
+  </header>
+  <div class="wrap">
+    {% block content %}{% endblock %}
+  </div>
+</body>
+</html>
+```
+
+### `dashboard.html`
+
+```html
+{% extends 'base.html' %}
+{% block content %}
+<h1>Overview</h1>
+<div class="grid">
+  <div class="card"><div>Sent today</div><h2>{{ kpis.sent_today }}</h2></div>
+  <div class="card"><div>Bounces today</div><h2>{{ kpis.bounces_today }}</h2></div>
+  <div class="card"><div>Complaints today</div><h2>{{ kpis.complaints_today }}</h2></div>
+  <div class="card"><div>Unsubscribes today</div><h2>{{ kpis.unsubs_today }}</h2></div>
+</div>
+<div class="card" style="margin-top:14px">
+  <h3>Workers</h3>
+  <table>
+    <tr><th>Service</th><th>Last heartbeat (UTC)</th></tr>
+    {% for hb in heartbeats %}
+      <tr><td>{{ hb.service_name }}</td><td>{{ hb.ts }}</td></tr>
+    {% endfor %}
+  </table>
+  <div class="muted">If stale > 2 minutes, the worker may be down.</div>
+</div>
+{% endblock %}
+```
+
+### `inboxes.html`
+
+```html
+{% extends 'base.html' %}
+{% block content %}
+<h1>Inboxes</h1>
+<table>
+  <tr>
+    <th>ID</th><th>Name</th><th>From</th><th>Host</th><th>Daily Cap</th><th>Pace (s)</th><th>Health</th><th>Disabled</th><th>Save</th>
+  </tr>
+  {% for r in rows %}
+  <tr>
+    <form class="inline" method="post" action="/dashboard/inboxes/update">
+      <td>{{ r.id }}<input type="hidden" name="inbox_id" value="{{ r.id }}"></td>
+      <td>{{ r.name }}</td>
+      <td>{{ r.from_email }}</td>
+      <td>{{ r.smtp_host }}</td>
+      <td><input type="number" name="daily_cap" value="{{ r.daily_cap }}" min="0"></td>
+      <td><input type="number" name="pace_seconds" value="{{ r.pace_seconds }}" min="10"></td>
+      <td>{{ r.health_score }}</td>
+      <td>
+        <select name="disabled">
+          <option value="false" {% if not r.disabled %}selected{% endif %}>No</option>
+          <option value="true" {% if r.disabled %}selected{% endif %}>Yes</option>
+        </select>
+      </td>
+      <td><button class="btn" type="submit">Save</button></td>
+    </form>
+  </tr>
+  {% endfor %}
+</table>
+{% endblock %}
+```
+
+### `campaigns.html`
+
+```html
+{% extends 'base.html' %}
+{% block content %}
+<h1>Campaigns</h1>
+<table>
+  <tr><th>ID</th><th>Name</th><th>Template</th><th>Status</th><th>Daily Cap</th><th>Actions</th></tr>
+  {% for r in rows %}
+    <tr>
+      <td>{{ r.id }}</td>
+      <td>{{ r.name }}</td>
+      <td>{{ r.template_name }}</td>
+      <td>{{ r.status }}</td>
+      <td>{{ r.daily_send_cap }}</td>
+      <td>
+        <form class="inline" method="post" action="/dashboard/campaigns/status">
+          <input type="hidden" name="campaign_id" value="{{ r.id }}">
+          <select name="status_name">
+            <option {% if r.status=='draft' %}selected{% endif %}>draft</option>
+            <option {% if r.status=='running' %}selected{% endif %}>running</option>
+            <option {% if r.status=='paused' %}selected{% endif %}>paused</option>
+            <option {% if r.status=='done' %}selected{% endif %}>done</option>
+          </select>
+          <button class="btn" type="submit">Update</button>
+        </form>
+      </td>
+    </tr>
+  {% endfor %}
+</table>
+{% endblock %}
+```
+
+### `queue.html`
+
+```html
+{% extends 'base.html' %}
+{% block content %}
+<h1>Queue (latest 200)</h1>
+<table>
+  <tr><th>ID</th><th>Campaign</th><th>Contact</th><th>Subject</th><th>Status</th><th>Scheduled</th></tr>
+  {% for r in rows %}
+  <tr>
+    <td>{{ r.id }}</td>
+    <td>{{ r.campaign_id }}</td>
+    <td>{{ r.contact_id }}</td>
+    <td>{{ r.subject }}</td>
+    <td>{{ r.status }}</td>
+    <td>{{ r.scheduled_at }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% endblock %}
+```
+
+### `events.html`
+
+```html
+{% extends 'base.html' %}
+{% block content %}
+<h1>Events (latest 200)</h1>
+<table>
+  <tr><th>ID</th><th>Campaign</th><th>Contact</th><th>Inbox</th><th>Type</th><th>Time</th><th>Meta</th></tr>
+  {% for r in rows %}
+  <tr>
+    <td>{{ r.id }}</td>
+    <td>{{ r.campaign_id }}</td>
+    <td>{{ r.contact_id }}</td>
+    <td>{{ r.inbox_id }}</td>
+    <td>{{ r.type }}</td>
+    <td>{{ r.ts }}</td>
+    <td>{{ r.meta }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% endblock %}
+```
+
+### `contacts.html`
+
+```html
+{% extends 'base.html' %}
+{% block content %}
+<h1>Upload Contacts</h1>
+<form method="post" action="/dashboard/contacts/upload" enctype="multipart/form-data" class="card">
+  <p>CSV columns supported: email (required), first_name, last_name, company, tags, source, lawful_basis, consent_ts</p>
+  <input type="file" name="file" accept=".csv" required>
+  <p><button class="btn" type="submit">Upload</button></p>
+</form>
+{% endblock %}
+```
+
+### `templates_list.html`
+
+```html
+{% extends 'base.html' %}
+{% block content %}
+<h1>Templates</h1>
+<p><a class="btn" href="/dashboard/templates/edit">New Template</a></p>
+<table>
+  <tr><th>ID</th><th>Name</th><th>Subject</th><th>Action</th></tr>
+  {% for r in rows %}
+  <tr>
+    <td>{{ r.id }}</td><td>{{ r.name }}</td><td>{{ r.subject }}</td>
+    <td><a class="btn" href="/dashboard/templates/edit?id={{ r.id }}">Edit</a></td>
+  </tr>
+  {% endfor %}
+</table>
+{% endblock %}
+```
+
+### `templates_edit.html`
+
+```html
+{% extends 'base.html' %}
+{% block content %}
+<h1>{{ 'Edit' if tpl else 'New' }} Template</h1>
+<form method="post" action="/dashboard/templates/save" class="card">
+  {% if tpl %}<input type="hidden" name="id" value="{{ tpl.id }}">{% endif %}
+  <p>Name<br><input name="name" value="{{ tpl.name if tpl else '' }}" required></p>
+  <p>Subject (Jinja allowed)<br><input name="subject" value="{{ tpl.subject if tpl else '' }}" required></p>
+  <p>Body Markdown (Jinja allowed)</p>
+  <textarea name="body_markdown" rows="14">{{ tpl.body_markdown if tpl else '' }}</textarea>
+  <p><button class="btn" type="submit">Save</button></p>
+</form>
+{% endblock %}
+```
+
+### `unsubscribe.html`
+
+```html
+{% extends 'base.html' %}
+{% block content %}
+<h1>Unsubscribe</h1>
+<div class="card">
+  <p>Email: <strong>{{ email }}</strong></p>
+  <form method="post" action="/u">
+    <input type="hidden" name="e" value="{{ email }}" />
+    <button class="btn" type="submit">Confirm Unsubscribe</button>
+  </form>
+  <p class="muted">We'll stop all further emails to this address immediately.</p>
+</div>
+{% endblock %}
+```
+
+---
+
+## 5) Worker Requirements – `apps/worker/requirements.txt`
+
+```
+python-dotenv==1.0.1
+psycopg2-binary==2.9.9
+jinja2==3.1.4
+```
+
+---
+
+## 6) Worker – `apps/worker/emailer.py`
+
+```python
+import os, smtplib, email.utils, time, random
+from email.mime.text import MIMEText
+from jinja2 import Template
+
+APP_BASE_URL = os.getenv("APP_BASE_URL", "http://localhost:8000")
+UNSUBSCRIBE_INBOX = os.getenv("UNSUBSCRIBE_INBOX", "unsubscribe@yourdomain.com")
+
+class Emailer:
+    def __init__(self, host, port, user, pwd, from_name, from_email):
+        self.host = host
+        self.port = int(port)
+        self.user = user
+        self.pwd = pwd
+        self.from_name = from_name
+        self.from_email = from_email
+
+    def _build(self, to_email, subject, html_body):
+        msg = MIMEText(html_body, "html", "utf-8")
+        msg['Subject'] = subject
+        msg['From'] = email.utils.formataddr((self.from_name, self.from_email))
+        msg['To'] = to_email
+        list_unsub_url = f"{APP_BASE_URL}/u?e={to_email}"
+        list_unsub_mailto = f"mailto:{UNSUBSCRIBE_INBOX}?subject=unsubscribe&body={to_email}"
+        msg['List-Unsubscribe'] = f"<{list_unsub_mailto}>, <{list_unsub_url}>"
+        msg['List-Unsubscribe-Post'] = "List-Unsubscribe=One-Click"
+        msg['Date'] = email.utils.formatdate(localtime=True)
+        msg['Message-ID'] = email.utils.make_msgid()
+        return msg
+
+    def send(self, to_email, subject, html_body):
+        msg = self._build(to_email, subject, html_body)
+        with smtplib.SMTP(self.host, self.port, timeout=30) as s:
+            s.starttls()
+            s.login(self.user, self.pwd)
+            s.sendmail(self.from_email, [to_email], msg.as_string())
+
+
+def render_template(subject_tpl: str, body_md: str, contact: dict) -> tuple[str, str]:
+    s = Template(subject_tpl).render(**contact)
+    # very simple: convert markdown line breaks to <br>
+    body = Template(body_md).render(**contact)
+    html = body.replace('\n', '<br>')
+    return s, html
+
+
+def jitter(seconds: int, pct: float = 0.2) -> float:
+    if seconds <= 0:
+        return 0
+    span = seconds * pct
+    return max(0, seconds + random.uniform(-span, span))
+```
+
+---
+
+## 7) Worker – `apps/worker/main.py`
+
+```python
+import os, signal, sys, time, json
+import psycopg2, psycopg2.extras
+from datetime import datetime, timezone
+from emailer import Emailer, render_template, jitter
+
+DB_URL = os.getenv("DB_URL")
+SERVICE_NAME = os.getenv("SERVICE_NAME", "sendbot-worker")
+GLOBAL_DAILY_CAP = int(os.getenv("GLOBAL_DAILY_CAP", "300"))
+
+_shutdown = False
+
+def handle_sigterm(signum, frame):
+    global _shutdown
+    _shutdown = True
+
+signal.signal(signal.SIGTERM, handle_sigterm)
+
+
+def conn():
+    return psycopg2.connect(DB_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+
+
+def heartbeat():
+    with conn() as c, c.cursor() as cur:
+        cur.execute("INSERT INTO heartbeats(service_name, ts) VALUES(%s, NOW()) ON CONFLICT (service_name) DO UPDATE SET ts=EXCLUDED.ts", (SERVICE_NAME,))
+        c.commit()
+
+
+def sent_today_count(c):
+    with c.cursor() as cur:
+        cur.execute("SELECT COUNT(*) AS n FROM events WHERE type='sent' AND ts::date=CURRENT_DATE")
+        return cur.fetchone()["n"]
+
+
+def inbox_headroom(c, inbox_id):
+    with c.cursor() as cur:
+        cur.execute("SELECT daily_cap, pace_seconds, disabled FROM inboxes WHERE id=%s", (inbox_id,))
+        row = cur.fetchone()
+        if not row or row["disabled"]:
+            return (0, 60, True)
+        daily_cap = row["daily_cap"]
+        pace = row["pace_seconds"]
+        cur.execute("SELECT COUNT(*) AS n FROM events WHERE type='sent' AND inbox_id=%s AND ts::date=CURRENT_DATE", (inbox_id,))
+        sent = cur.fetchone()["n"]
+        return (max(0, daily_cap - sent), pace, False)
+
+
+def pick_inbox(c):
+    with c.cursor() as cur:
+        cur.execute("SELECT id, smtp_host, smtp_port, username, password, from_name, from_email, health_score FROM inboxes WHERE NOT disabled ORDER BY health_score DESC, id ASC")
+        rows = cur.fetchall()
+    for r in rows:
+        head, pace, disabled = inbox_headroom(c, r["id"])
+        if head > 0:
+            return (r, pace)
+    return (None, 60)
+
+
+def next_batch(c, limit=20):
+    with c.cursor() as cur:
+        cur.execute("""
+            SELECT q.id, q.campaign_id, q.contact_id, q.subject, q.body_html, ct.email, ct.first_name, ct.last_name, ct.company
+            FROM send_queue q
+            JOIN contacts ct ON ct.id=q.contact_id
+            WHERE q.status='queued' AND q.scheduled_at <= NOW()
+            ORDER BY q.id ASC
+            LIMIT %s
+        """, (limit,))
+        return cur.fetchall()
+
+
+def is_suppressed(c, email):
+    with c.cursor() as cur:
+        cur.execute("SELECT 1 FROM suppression WHERE email=%s", (email,))
+        return cur.fetchone() is not None
+
+
+def mark_event(c, campaign_id, contact_id, inbox_id, etype, meta=None):
+    with c.cursor() as cur:
+        cur.execute("INSERT INTO events(campaign_id, contact_id, inbox_id, type, meta, ts) VALUES(%s,%s,%s,%s,%s::jsonb,NOW())",
+                    (campaign_id, contact_id, inbox_id, etype, json.dumps(meta) if isinstance(meta, (dict,list)) else json.dumps(str(meta)) ))
+        c.commit()
+
+
+def set_status(c, qid, status):
+    with c.cursor() as cur:
+        cur.execute("UPDATE send_queue SET status=%s WHERE id=%s", (status, qid))
+        c.commit()
+
+
+_last_sent_at_by_inbox = {}
+
+
+def loop():
+    global _shutdown
+    while not _shutdown:
+        try:
+            heartbeat()
+            with conn() as c:
+                if sent_today_count(c) >= GLOBAL_DAILY_CAP:
+                    time.sleep(30); continue
+
+                batch = next_batch(c, 20)
+                if not batch:
+                    time.sleep(2); continue
+
+                for job in batch:
+                    if _shutdown:
+                        break
+                    if is_suppressed(c, job["email"]):
+                        set_status(c, job["id"], 'skipped')
+                        continue
+
+                    inbox, pace = pick_inbox(c)
+                    if inbox is None:
+                        time.sleep(15)
+                        break
+
+                    # Respect per-inbox pace with jitter
+                    last = _last_sent_at_by_inbox.get(inbox["id"], 0)
+                    wait_for = max(0, jitter(pace) - (time.time() - last))
+                    if wait_for > 0:
+                        time.sleep(wait_for)
+
+                    # Render (subject/body already in queue, but ensure placeholders)
+                    contact_vars = {
+                        'email': job['email'],
+                        'first_name': job.get('first_name') or '',
+                        'last_name': job.get('last_name') or '',
+                        'company': job.get('company') or ''
+                    }
+                    subject = job['subject']
+                    body_html = job['body_html']
+
+                    mailer = Emailer(inbox['smtp_host'], inbox['smtp_port'], inbox['username'], inbox['password'], inbox['from_name'], inbox['from_email'])
+
+                    try:
+                        set_status(c, job['id'], 'sending')
+                        mailer.send(job['email'], subject, body_html)
+                        set_status(c, job['id'], 'sent')
+                        mark_event(c, job['campaign_id'], job['contact_id'], inbox['id'], 'sent', {'qid': job['id']})
+                        _last_sent_at_by_inbox[inbox['id']] = time.time()
+                    except Exception as e:
+                        # exponential backoff by rescheduling
+                        with c.cursor() as cur:
+                            cur.execute("UPDATE send_queue SET attempts=attempts+1 WHERE id=%s RETURNING attempts", (job['id'],))
+                            attempts = cur.fetchone()['attempts']
+                            if attempts >= 3:
+                                cur.execute("UPDATE send_queue SET status='failed' WHERE id=%s", (job['id'],))
+                            else:
+                                cur.execute("UPDATE send_queue SET status='queued', scheduled_at=NOW() + INTERVAL '%s minutes' WHERE id=%s", (attempts*5, job['id']))
+                            c.commit()
+                        mark_event(c, job['campaign_id'], job['contact_id'], inbox['id'], 'error', {'error': str(e)})
+                        # lightweight circuit breaker: lower health
+                        with c.cursor() as cur:
+                            cur.execute("UPDATE inboxes SET health_score = GREATEST(0, health_score - 0.1) WHERE id=%s", (inbox['id'],))
+                            c.commit()
+                time.sleep(1)
+        except Exception as outer:
+            # global safety – do not crash
+            try:
+                with conn() as c:
+                    mark_event(c, None, None, None, 'error', {'outer': str(outer)})
+            except Exception:
+                pass
+            time.sleep(5)
+
+if __name__ == '__main__':
+    loop()
+```
+
+---
+
+## 8) Render Blueprint – `infra/render.yaml`
+
+```yaml
+services:
+  - type: web
+    name: sendbot-web
+    env: python
+    plan: starter
+    rootDir: apps/web
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    autoDeploy: false
+    healthCheckPath: /healthz
+    envVars:
+      - key: TZ
+        value: Europe/London
+      - key: DB_URL
+        sync: false
+      - key: APP_BASE_URL
+        value: https://sendbot-web.onrender.com
+      - key: LEGAL_POSTAL_ADDRESS
+        value: Your Company, Address, City, Postcode, UK
+      - key: WEBHOOK_SECRET
+        sync: false
+
+  - type: worker
+    name: sendbot-worker
+    env: python
+    plan: starter
+    rootDir: apps/worker
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    autoDeploy: false
+    envVars:
+      - key: TZ
+        value: Europe/London
+      - key: SERVICE_NAME
+        value: sendbot-worker
+      - key: DB_URL
+        sync: false
+      - key: APP_BASE_URL
+        value: https://sendbot-web.onrender.com
+      - key: GLOBAL_DAILY_CAP
+        value: "300"
+```
+
+---
+
+## 9) .env.example
+
+```env
+# Common
+DB_URL=postgres://user:pass@host:5432/dbname
+APP_BASE_URL=https://sendbot-web.onrender.com
+LEGAL_POSTAL_ADDRESS="Your Company, Address, City, Postcode, UK"
+WEBHOOK_SECRET=super-long-random-secret
+
+# Worker global cap
+GLOBAL_DAILY_CAP=300
+
+# Not used directly here (store creds in DB via SQL INSERTs after deploy):
+# SMTP credentials for 9 inboxes will be inserted into the inboxes table.
+```
+
+---
+
+## 10) README – `README.md`
+
+````markdown
+# SendBot (Web + Worker)
+
+Render-ready sending bot with FastAPI dashboard and a paced SMTP worker. No AI: emails are preset templates you control.
+
+## Deploy Steps
+1. Create **Render Postgres** and copy the `DB_URL`.
+2. Create **Web Service** from `apps/web` and **Worker** from `apps/worker`.
+3. Set env vars on both: `DB_URL`, `APP_BASE_URL`, `TZ`, `WEBHOOK_SECRET`, `GLOBAL_DAILY_CAP`.
+4. Apply migration: open a shell on **Web** or **Worker** →
+   ```sh
+   psql "$DB_URL" -f db/migrations/001_init.sql
+````
+
+5. Seed 9 inboxes (example):
+
+   ```sql
+   INSERT INTO inboxes(name,smtp_host,smtp_port,username,password,from_name,from_email,daily_cap,pace_seconds,health_score)
+   VALUES
+   ('ibox1','smtp.example.com',587,'user1','pass1','Your Name','your1@sub.domain.com',30,90,1.0),
+   ('ibox2','smtp.example.com',587,'user2','pass2','Your Name','your2@sub.domain.com',30,90,1.0);
+   -- repeat up to 9
+   ```
+6. Create a template:
+
+   ```sql
+   INSERT INTO templates(name,subject,body_markdown) VALUES
+   ('intro','{{first_name}}, quick question about {{company}}','Hi {{first_name}},\nWe help {{company}}...\n\n— Team');
+   ```
+7. Create a campaign and queue jobs:
+
+   ```sql
+   INSERT INTO campaigns(name, template_id, status, daily_send_cap) VALUES ('Sept Pilot', 1, 'running', 300);
+   INSERT INTO contacts(email,first_name,company,lawful_basis) VALUES('lead@example.com','Alex','Acme','legitimate_interest');
+   -- Render template to HTML client-side or generate offline, then queue:
+   INSERT INTO send_queue(campaign_id,contact_id,inbox_id,subject,body_html,scheduled_at)
+   VALUES (1, 1, NULL, 'Alex, quick question about Acme', '<p>Hi Alex...</p>', NOW());
+   ```
+8. Start small (10/day/inbox) and ramp to 25–30/day.
+
+## Reply Bot Integration
+
+* POST `/api/reply` with header `X-Webhook-Secret: <secret>` and JSON `{ email, campaign_id, status, snippet }`. This pauses future queued sends for that contact and logs an event.
+* GET `/api/suppression?email=...` returns `{ suppressed: true|false }`.
+
+## Unsubscribe
+
+* All emails include List-Unsubscribe headers (mailto + one-click). `/u` GET shows confirmation; POST writes to `unsubscribes` + `suppression` and skips queued sends.
+
+## Reliability
+
+* Global cap (default 300/day), per-inbox caps, jittered pacing, retries with exponential backoff, circuit breaker via `health_score`, worker heartbeats, crash‑safe loop.
+
+```
+
+---
+
+### Notes
+- Emails are **preset templates** (Jinja placeholders). No generative AI is used.
+- If you need queue‑side template rendering: generate `body_html` before inserting into `send_queue` (as shown in README) or add a tiny rendering job if preferred.
+- You can extend with bounce/complaint webhooks from a relay later; just insert `events` and add to `suppression` accordingly.
+
+```

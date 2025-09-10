@@ -1,0 +1,12 @@
+{% extends 'base.html' %}
+{% block content %}
+<h1>{{ 'Edit' if tpl else 'New' }} Template</h1>
+<form method="post" action="/dashboard/templates/save" class="card">
+{% if tpl %}<input type="hidden" name="id" value="{{ tpl.id }}">{% endif %}
+<p>Name<br><input name="name" value="{{ tpl.name if tpl else '' }}" required></p>
+<p>Subject (Jinja allowed)<br><input name="subject" value="{{ tpl.subject if tpl else '' }}" required></p>
+<p>Body Markdown (Jinja allowed)</p>
+<textarea name="body_markdown" rows="14">{{ tpl.body_markdown if tpl else '' }}</textarea>
+<p><button class="btn" type="submit">Save</button></p>
+</form>
+{% endblock %}

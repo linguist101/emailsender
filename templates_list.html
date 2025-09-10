@@ -1,0 +1,14 @@
+{% extends 'base.html' %}
+{% block content %}
+<h1>Templates</h1>
+<p><a class="btn" href="/dashboard/templates/edit">New Template</a></p>
+<table>
+<tr><th>ID</th><th>Name</th><th>Subject</th><th>Action</th></tr>
+{% for r in rows %}
+<tr>
+<td>{{ r.id }}</td><td>{{ r.name }}</td><td>{{ r.subject }}</td>
+<td><a class="btn" href="/dashboard/templates/edit?id={{ r.id }}">Edit</a></td>
+</tr>
+{% endfor %}
+</table>
+{% endblock %}

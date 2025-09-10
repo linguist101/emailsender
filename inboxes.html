@@ -1,0 +1,29 @@
+{% extends 'base.html' %}
+{% block content %}
+<h1>Inboxes</h1>
+<table>
+<tr>
+<th>ID</th><th>Name</th><th>From</th><th>Host</th><th>Daily Cap</th><th>Pace (s)</th><th>Health</th><th>Disabled</th><th>Save</th>
+</tr>
+{% for r in rows %}
+<tr>
+<form class="inline" method="post" action="/dashboard/inboxes/update">
+<td>{{ r.id }}<input type="hidden" name="inbox_id" value="{{ r.id }}"></td>
+<td>{{ r.name }}</td>
+<td>{{ r.from_email }}</td>
+<td>{{ r.smtp_host }}</td>
+<td><input type="number" name="daily_cap" value="{{ r.daily_cap }}" min="0"></td>
+<td><input type="number" name="pace_seconds" value="{{ r.pace_seconds }}" min="10"></td>
+<td>{{ r.health_score }}</td>
+<td>
+<select name="disabled">
+<option value="false" {% if not r.disabled %}selected{% endif %}>No</option>
+<option value="true" {% if r.disabled %}selected{% endif %}>Yes</option>
+</select>
+</td>
+<td><button class="btn" type="submit">Save</button></td>
+</form>
+</tr>
+{% endfor %}
+</table>
+{% endblock %}

@@ -1,0 +1,12 @@
+{% extends 'base.html' %}
+{% block content %}
+<h1>Unsubscribe</h1>
+<div class="card">
+<p>Email: <strong>{{ email }}</strong></p>
+<form method="post" action="/u">
+<input type="hidden" name="e" value="{{ email }}" />
+<button class="btn" type="submit">Confirm Unsubscribe</button>
+</form>
+<p class="muted">We'll stop all further emails to this address immediately.</p>
+</div>
+{% endblock %}

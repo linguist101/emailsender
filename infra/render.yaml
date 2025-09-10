@@ -1,0 +1,42 @@
+services:
+- type: web
+name: sendbot-web
+env: python
+plan: starter
+rootDir: apps/web
+buildCommand: pip install -r requirements.txt
+startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+autoDeploy: false
+healthCheckPath: /healthz
+envVars:
+- key: TZ
+value: Europe/London
+- key: DB_URL
+sync: false
+- key: APP_BASE_URL
+value: https://sendbot-web.onrender.com
+- key: LEGAL_POSTAL_ADDRESS
+value: Your Company, Address, City, Postcode, UK
+- key: WEBHOOK_SECRET
+sync: false
+
+
+- type: worker
+name: sendbot-worker
+env: python
+plan: starter
+rootDir: apps/worker
+buildCommand: pip install -r requirements.txt
+startCommand: python main.py
+autoDeploy: false
+envVars:
+- key: TZ
+value: Europe/London
+- key: SERVICE_NAME
+value: sendbot-worker
+- key: DB_URL
+sync: false
+- key: APP_BASE_URL
+value: https://sendbot-web.onrender.com
+- key: GLOBAL_DAILY_CAP
+value: "300"

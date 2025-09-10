@@ -1,0 +1,9 @@
+{% extends 'base.html' %}
+{% block content %}
+<h1>Upload Contacts</h1>
+<form method="post" action="/dashboard/contacts/upload" enctype="multipart/form-data" class="card">
+<p>CSV columns supported: email (required), first_name, last_name, company, tags, source, lawful_basis, consent_ts</p>
+<input type="file" name="file" accept=".csv" required>
+<p><button class="btn" type="submit">Upload</button></p>
+</form>
+{% endblock %}

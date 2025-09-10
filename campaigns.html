@@ -1,0 +1,28 @@
+{% extends 'base.html' %}
+{% block content %}
+<h1>Campaigns</h1>
+<table>
+<tr><th>ID</th><th>Name</th><th>Template</th><th>Status</th><th>Daily Cap</th><th>Actions</th></tr>
+{% for r in rows %}
+<tr>
+<td>{{ r.id }}</td>
+<td>{{ r.name }}</td>
+<td>{{ r.template_name }}</td>
+<td>{{ r.status }}</td>
+<td>{{ r.daily_send_cap }}</td>
+<td>
+<form class="inline" method="post" action="/dashboard/campaigns/status">
+<input type="hidden" name="campaign_id" value="{{ r.id }}">
+<select name="status_name">
+<option {% if r.status=='draft' %}selected{% endif %}>draft</option>
+<option {% if r.status=='running' %}selected{% endif %}>running</option>
+<option {% if r.status=='paused' %}selected{% endif %}>paused</option>
+<option {% if r.status=='done' %}selected{% endif %}>done</option>
+</select>
+<button class="btn" type="submit">Update</button>
+</form>
+</td>
+</tr>
+{% endfor %}
+</table>
+{% endblock %}

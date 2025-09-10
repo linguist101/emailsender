@@ -1,0 +1,20 @@
+{% extends 'base.html' %}
+{% block content %}
+<h1>Overview</h1>
+<div class="grid">
+<div class="card"><div>Sent today</div><h2>{{ kpis.sent_today }}</h2></div>
+<div class="card"><div>Bounces today</div><h2>{{ kpis.bounces_today }}</h2></div>
+<div class="card"><div>Complaints today</div><h2>{{ kpis.complaints_today }}</h2></div>
+<div class="card"><div>Unsubscribes today</div><h2>{{ kpis.unsubs_today }}</h2></div>
+</div>
+<div class="card" style="margin-top:14px">
+<h3>Workers</h3>
+<table>
+<tr><th>Service</th><th>Last heartbeat (UTC)</th></tr>
+{% for hb in heartbeats %}
+<tr><td>{{ hb.service_name }}</td><td>{{ hb.ts }}</td></tr>
+{% endfor %}
+</table>
+<div class="muted">If stale > 2 minutes, the worker may be down.</div>
+</div>
+{% endblock %}

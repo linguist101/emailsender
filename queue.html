@@ -1,0 +1,17 @@
+{% extends 'base.html' %}
+{% block content %}
+<h1>Queue (latest 200)</h1>
+<table>
+<tr><th>ID</th><th>Campaign</th><th>Contact</th><th>Subject</th><th>Status</th><th>Scheduled</th></tr>
+{% for r in rows %}
+<tr>
+<td>{{ r.id }}</td>
+<td>{{ r.campaign_id }}</td>
+<td>{{ r.contact_id }}</td>
+<td>{{ r.subject }}</td>
+<td>{{ r.status }}</td>
+<td>{{ r.scheduled_at }}</td>
+</tr>
+{% endfor %}
+</table>
+{% endblock %}

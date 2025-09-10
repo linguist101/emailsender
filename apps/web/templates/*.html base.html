@@ -1,0 +1,41 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>SendBot</title>
+<style>
+body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 0; background:#f6f7fb; }
+header { background:#111827; color:#fff; padding:14px 20px; }
+nav a { color:#93c5fd; margin-right:14px; text-decoration:none; }
+.wrap { max-width:1040px; margin: 24px auto; padding: 0 16px; }
+table { width:100%; border-collapse: collapse; background:#fff; }
+th, td { padding:10px 12px; border-bottom:1px solid #eee; text-align:left; }
+h1 { font-size:22px; margin:0 0 14px; }
+.card { background:#fff; padding:16px; border-radius:10px; box-shadow: 0 1px 3px rgba(0,0,0,.05); }
+.grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(220px,1fr)); gap:14px; }
+.btn { background:#111827; color:#fff; padding:8px 12px; border-radius:8px; border:none; cursor:pointer; }
+.btn:disabled { opacity:.6; cursor:not-allowed; }
+input, select, textarea { width:100%; padding:8px; border:1px solid #ddd; border-radius:8px; }
+form.inline { display:inline; }
+.muted { color:#6b7280; font-size:12px; }
+</style>
+</head>
+<body>
+<header>
+<strong>SendBot</strong>
+<nav style="float:right">
+<a href="/dashboard">Overview</a>
+<a href="/dashboard/inboxes">Inboxes</a>
+<a href="/dashboard/campaigns">Campaigns</a>
+<a href="/dashboard/queue">Queue</a>
+<a href="/dashboard/events">Events</a>
+<a href="/dashboard/contacts">Contacts</a>
+<a href="/dashboard/templates">Templates</a>
+</nav>
+</header>
+<div class="wrap">
+{% block content %}{% endblock %}
+</div>
+</body>
+</html>

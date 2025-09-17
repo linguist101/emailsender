@@ -21,6 +21,18 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")
 
 app = FastAPI()
 
+def init_db():
+    import pathlib
+    sql_path = pathlib.Path(__file__).parent.parent.parent / "db/migrations/001_init.sql"
+    sql = sql_path.read_text()
+    with psycopg.connect(DB_URL) as conn, conn.cursor() as cur:
+        cur.execute(sql)
+        conn.commit()
+
+# Run migration once at startup
+init_db()
+
+
 # Templates
 TEMPLATES_DIR = os.path.join(os.path.dirname(__file__), "templates")
 env = Environment(

@@ -26,16 +26,17 @@ def init_db():
     sql_path = Path(__file__).resolve().parents[2] / "db" / "migrations" / "001_init.sql"
     script = sql_path.read_text(encoding="utf-8")
 
-    # Execute each statement safely
+    # Simple split on semicolon; safe for this migration (no functions/procedures)
+    statements = [s.strip() for s in script.split(";") if s.strip()]
+
     with psycopg.connect(DB_URL) as conn, conn.cursor() as cur:
-        for stmt in psql.split(script):
-            s = stmt.strip()
-            if not s:
-                continue
-            cur.execute(s)
+        for stmt in statements:
+            cur.execute(stmt + ";")
         conn.commit()
+
     print(f"[init_db] Applied migration from {sql_path}")
 
+# Run on startup
 init_db()
 
 

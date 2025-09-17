@@ -1,15 +1,16 @@
-- import psycopg2
-- import psycopg2.extras
-+ import psycopg
-+ from psycopg.rows import dict_row
+import os
+import csv
+import io
+from datetime import datetime
+
+import psycopg
+from psycopg.rows import dict_row
+
 from fastapi import FastAPI, Request, Form, UploadFile, File, Response
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from jinja2 import Environment, FileSystemLoader, select_autoescape
-from datetime import datetime
 from markdown2 import Markdown
-import csv
-import io
 
 DB_URL = os.getenv("DB_URL")
 APP_BASE_URL = os.getenv("APP_BASE_URL", "http://localhost:8000")

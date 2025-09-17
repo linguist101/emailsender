@@ -2,9 +2,11 @@ import os
 import csv
 import io
 from datetime import datetime
+from pathlib import Path
 
 import psycopg
 from psycopg.rows import dict_row
+from psycopg import sql as psql  # <-- for safe script splitting
 
 from fastapi import FastAPI, Request, Form, UploadFile, File, Response
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
@@ -12,25 +14,30 @@ from fastapi.staticfiles import StaticFiles
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from markdown2 import Markdown
 
-DB_URL = os.getenv("DB_URL")
-APP_BASE_URL = os.getenv("APP_BASE_URL", "http://localhost:8000")
-LEGAL_POSTAL_ADDRESS = os.getenv(
-    "LEGAL_POSTAL_ADDRESS", "Your Company, Address, City, Postcode, UK"
-)
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")
+DB_URL = os.getenv("DB_URL") or os.getenv("DATABASE_URL")
+if not DB_URL:
+    raise RuntimeError("Missing DB_URL/DATABASE_URL env var.")
 
 app = FastAPI()
 
+# ----- run migration once on startup -----
 def init_db():
-    import pathlib
-    sql_path = pathlib.Path(__file__).parent.parent.parent / "db/migrations/001_init.sql"
-    sql = sql_path.read_text()
-    with psycopg.connect(DB_URL) as conn, conn.cursor() as cur:
-        cur.execute(sql)
-        conn.commit()
+    # apps/web/app.py -> repo root -> db/migrations/001_init.sql
+    sql_path = Path(__file__).resolve().parents[2] / "db" / "migrations" / "001_init.sql"
+    script = sql_path.read_text(encoding="utf-8")
 
-# Run migration once at startup
+    # Execute each statement safely
+    with psycopg.connect(DB_URL) as conn, conn.cursor() as cur:
+        for stmt in psql.split(script):
+            s = stmt.strip()
+            if not s:
+                continue
+            cur.execute(s)
+        conn.commit()
+    print(f"[init_db] Applied migration from {sql_path}")
+
 init_db()
+
 
 
 # Templates

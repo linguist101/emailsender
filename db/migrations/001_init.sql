@@ -1,4 +1,5 @@
 -- Use on Render Postgres
+
 CREATE TABLE IF NOT EXISTS contacts (
   id BIGSERIAL PRIMARY KEY,
   email TEXT UNIQUE NOT NULL,
@@ -84,6 +85,7 @@ CREATE TABLE IF NOT EXISTS heartbeats (
   ts TIMESTAMPTZ
 );
 
+-- Indexes
 CREATE INDEX IF NOT EXISTS idx_queue_status_sched ON send_queue(status, scheduled_at);
 CREATE INDEX IF NOT EXISTS idx_events_type_ts ON events(type, ts DESC);
 CREATE INDEX IF NOT EXISTS idx_contacts_email ON contacts(email);

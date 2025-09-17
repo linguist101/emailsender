@@ -35,7 +35,7 @@ app.mount("/static", StaticFiles(directory=TEMPLATES_DIR), name="static")
 
 # --- DB helper
 def get_conn():
-    return psycopg2.connect(DB_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+    return psycopg.connect(DB_URL, row_factory=dict_row)
 
 
 # --- Render helper

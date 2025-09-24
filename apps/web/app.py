@@ -140,6 +140,44 @@ async def update_inbox(
     return RedirectResponse(url="/dashboard/inboxes", status_code=303)
 
 
+from fastapi import HTTPException
+
+@app.get("/dashboard/inboxes/new")
+def new_inbox_form():
+    return render("inboxes_new.html")
+
+@app.post("/dashboard/inboxes/create")
+async def create_inbox(
+    name: str = Form(...),
+    smtp_host: str = Form(...),
+    smtp_port: int = Form(587),
+    username: str = Form(...),
+    password: str = Form(...),
+    from_name: str = Form(...),
+    from_email: str = Form(...),
+    daily_cap: int = Form(30),
+    monthly_cap: int = Form(1000),
+    pace_seconds: int = Form(90),
+):
+    if "@" not in from_email:
+        raise HTTPException(status_code=400, detail="from_email must be a valid email")
+    with get_conn() as c, c.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO inboxes
+              (name, smtp_host, smtp_port, username, password, from_name, from_email,
+               daily_cap, monthly_cap, pace_seconds, health_score, disabled)
+            VALUES
+              (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,1.0,false)
+            """,
+            (name, smtp_host, smtp_port, username, password, from_name, from_email,
+             daily_cap, monthly_cap, pace_seconds),
+        )
+        c.commit()
+    return RedirectResponse(url="/dashboard/inboxes", status_code=303)
+
+
+
 @app.get("/dashboard/campaigns")
 def page_campaigns():
     with get_conn() as c, c.cursor() as cur:

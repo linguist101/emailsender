@@ -1,0 +1,19 @@
+{% extends 'base.html' %}
+{% block content %}
+<h1>New Inbox</h1>
+<form method="post" action="/dashboard/inboxes/create" class="card">
+  <p>Name<br><input name="name" required></p>
+  <p>SMTP Host<br><input name="smtp_host" required></p>
+  <p>SMTP Port<br><input type="number" name="smtp_port" value="587" required></p>
+  <p>Username<br><input name="username" required></p>
+  <p>Password<br><input type="password" name="password" required></p>
+  <p>From Name<br><input name="from_name" required></p>
+  <p>From Email<br><input name="from_email" required></p>
+  <div class="grid">
+    <div><p>Daily Cap<br><input type="number" name="daily_cap" value="30" min="0"></p></div>
+    <div><p>Monthly Cap<br><input type="number" name="monthly_cap" value="1000" min="0"></p></div>
+    <div><p>Pace (seconds)<br><input type="number" name="pace_seconds" value="90" min="10"></p></div>
+  </div>
+  <p><button class="btn" type="submit">Create Inbox</button></p>
+</form>
+{% endblock %}

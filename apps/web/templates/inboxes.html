@@ -15,25 +15,44 @@
     <th>Health</th>
     <th>Disabled</th>
     <th>Save</th>
+    <th>Disconnect</th>
   </tr>
+
   {% for r in rows %}
   <tr>
-    <form class="inline" method="post" action="/dashboard/inboxes/update">
-      <td>{{ r.id }}<input type="hidden" name="inbox_id" value="{{ r.id }}"></td>
-      <td>{{ r.name }}</td>
-      <td>{{ r.from_email }}</td>
-      <td>{{ r.smtp_host }}</td>
-      <td><input type="number" name="daily_cap" value="{{ r.daily_cap }}" min="0"></td>
-      <td><input type="number" name="pace_seconds" value="{{ r.pace_seconds }}" min="10"></td>
-      <td>{{ r.health_score }}</td>
-      <td>
+    <td>{{ r.id }}</td>
+    <td>{{ r.name }}</td>
+    <td>{{ r.from_email }}</td>
+    <td>{{ r.smtp_host }}</td>
+
+    <!-- Update form spans the next few cells (but not the whole row) -->
+    <td>
+      <form class="inline" method="post" action="/dashboard/inboxes/update">
+        <input type="hidden" name="inbox_id" value="{{ r.id }}">
+        <input type="number" name="daily_cap" value="{{ r.daily_cap }}" min="0">
+    </td>
+    <td>
+        <input type="number" name="pace_seconds" value="{{ r.pace_seconds }}" min="10">
+    </td>
+    <td>{{ r.health_score }}</td>
+    <td>
         <select name="disabled">
           <option value="false" {% if not r.disabled %}selected{% endif %}>No</option>
           <option value="true" {% if r.disabled %}selected{% endif %}>Yes</option>
         </select>
-      </td>
-      <td><button class="btn" type="submit">Save</button></td>
-    </form>
+    </td>
+    <td>
+        <button class="btn" type="submit">Save</button>
+      </form>
+    </td>
+
+    <!-- Separate delete form in its own cell (not nested) -->
+    <td>
+      <form class="inline" method="post" action="/dashboard/inboxes/delete" onsubmit="return confirm('Disconnect this inbox?');">
+        <input type="hidden" name="inbox_id" value="{{ r.id }}">
+        <button class="btn" type="submit" style="background:#991b1b">Disconnect</button>
+      </form>
+    </td>
   </tr>
   {% endfor %}
 </table>

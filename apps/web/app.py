@@ -176,6 +176,20 @@ async def create_inbox(
         c.commit()
     return RedirectResponse(url="/dashboard/inboxes", status_code=303)
 
+@app.post("/dashboard/inboxes/delete")
+async def delete_inbox(inbox_id: int = Form(...)):
+    # Deleting is safe: send_queue.inbox_id has ON DELETE SET NULL.
+    with get_conn() as c, c.cursor() as cur:
+        # (Optional) ensure it exists
+        cur.execute("SELECT id FROM inboxes WHERE id=%s", (inbox_id,))
+        if not cur.fetchone():
+            return RedirectResponse(url="/dashboard/inboxes", status_code=303)
+
+        # Remove the inbox; any queued rows will have inbox_id set to NULL automatically.
+        cur.execute("DELETE FROM inboxes WHERE id=%s", (inbox_id,))
+        c.commit()
+    return RedirectResponse(url="/dashboard/inboxes", status_code=303)
+
 
 
 @app.get("/dashboard/campaigns")
